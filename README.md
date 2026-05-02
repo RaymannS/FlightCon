@@ -1,4 +1,4 @@
-STEP 1 Program esp32:
+# STEP 1 Program esp32:
 dont have battery or cable plugged in
 
 Make sure you have platformio installed from the vscode extentions
@@ -26,7 +26,7 @@ If something did not init then unplug esp
 
 double check if wires are loose then try again
 
-STEP 2 Set up GSC:
+# STEP 2 Set up GSC:
 Open vscode by clicking top left icon -> programming -> vscode
 
 First terminal:
@@ -39,3 +39,27 @@ now make a second terminal and leave this first one alone
 Only crtl-c out of this terminal when all done, else leave it running the whole time
 
 Second terminal:
+open a terminal then cd into "/src/moose-bowl-db"
+
+run command "spacetime publish -s local moosebowldb"
+
+should say Publishing module... {long string of characters}
+
+now cd into src. yea a second src. full path should look like
+"irec-2026-ground-station/src/moose-bowl-db/src"
+
+now this command will begin taking transmitting data and adding it to database. run it when you want to begin doing that. If you want to make sure the esp is transmitting then you can run it for a short time and crtl-c it anytime
+
+run "cargo run"
+
+# STEP 3 put esp on battery:
+unplug esp from the cable. 
+
+add the battery wires to 5v and gnd
+
+a red led should light up showing it has power
+
+can double check it is transmitting by running
+"cargo run" on gsc to verify
+
+that should be it
