@@ -46,12 +46,22 @@ bool bar_init(void)
         return false;
     }
 
+    // ── Sampling config for Kalman filter use ────────────────────────────────
+    // We trade some hardware filtering for speed, letting the Kalman filter
+    // handle noise reduction instead.
+    //
+    // STANDBY_MS_1 + SAMPLING_X4 pressure → ~80 Hz output rate
+    // (STANDBY_MS_0_5 only exists in the BME280 library, not BMP280)
+    // FILTER_X4 keeps light IIR hardware filtering to reject spikes
+    //
+    // If you are NOT using the Kalman filter, revert to:
+    //   SAMPLING_X16, FILTER_X16, STANDBY_MS_500  (~26 Hz, smoother)
     _bmp.setSampling(
-        Adafruit_BMP280::MODE_NORMAL,
-        Adafruit_BMP280::SAMPLING_X2,
-        Adafruit_BMP280::SAMPLING_X16,
-        Adafruit_BMP280::FILTER_X16,
-        Adafruit_BMP280::STANDBY_MS_500
+        Adafruit_BMP280::MODE_NORMAL,       // Continuous measurement
+        Adafruit_BMP280::SAMPLING_X2,       // Temperature oversampling x2
+        Adafruit_BMP280::SAMPLING_X4,       // Pressure oversampling x4 (~80Hz)
+        Adafruit_BMP280::FILTER_X4,         // Light IIR filter — Kalman handles rest
+        Adafruit_BMP280::STANDBY_MS_1       // 1ms standby — fastest available in BMP280 library
     );
 
     _initialised = true;

@@ -4,31 +4,17 @@
 #include "transmitter.h"
 #include "bar.h"
 #include "servo.h"
-
-#ifdef ENABLE_OTA
-#include <WiFi.h>
-#include <ArduinoOTA.h>
-#endif
-
-#ifdef ENABLE_OTA // OTA enabled via build flag in platformio.ini
-static bool otaEnabled = false;
-#endif
-
-// README: How to run:
-
-// pio run -t upload
-// -> Get IP Address from console:
-// pio run -t upload --upload-port ADDR (e.g., 192.168.1.50)
-
+#include "kalman.h"
 
 // ─── Transmit interval ────────────────────────────────────────────────────────
-static constexpr uint32_t kTransmitIntervalMs = 50;
-static uint32_t lastTxMs = 0;
+static constexpr uint32_t kTransmitIntervalMs = 50;   // 20 Hz downlink
+static uint32_t lastTxMs    = 0;
+static uint32_t lastLoopMs  = 0;   // used to compute dt for Kalman
 
 // ─── Airbrake config ──────────────────────────────────────────────────────────
-static constexpr int   kServoChannel    = 0;
-static constexpr float kAirbrakeAngle   = 45.0f;   // degrees — deployed
-static constexpr float kNeutralAngle    = 0.0f;    // degrees — retracted / safe
+static constexpr int   kServoChannel  = 0;
+static constexpr float kAirbrakeAngle = 45.0f;   // degrees — deployed
+static constexpr float kNeutralAngle  = 0.0f;    // degrees — retracted / safe
 
 // ─── IREC compliance constants ────────────────────────────────────────────────
 
@@ -38,40 +24,41 @@ static constexpr float kAltitudeLockoutM = 2000.0f;
 // 7.3.1 — retract immediately if tilt exceeds 30° from vertical
 static constexpr float kMaxTiltDeg = 30.0f;
 
-// Airbrake deployment altitude target (AGL). Must be above lockout.
-// Adjust based on OpenRocket simulation for your motor + airframe.
-static constexpr float kDeployAltM = 2500.0f;
-static constexpr float kDeployHysteresisM = 10.0f;  // avoids chattering
+// Airbrake deployment altitude (AGL, metres).
+// Set this from your OpenRocket simulation — should be above lockout.
+// Current value is a placeholder based on 3,258 m predicted apogee.
+static constexpr float kDeployAltM        = 2500.0f;
+static constexpr float kDeployHysteresisM = 5.0f;   // wider band when using Kalman
 
 // ─── Liftoff / burnout detection ─────────────────────────────────────────────
+//
+// With a 550 lb thrust motor and 42 lb rocket, off-pad acceleration ≈ 13G.
+// Liftoff threshold set to 5G (49 m/s²) — well above pad noise, well below launch.
+// accel_y is gravity-compensated by BNO055, so 0 m/s² at rest.
 
-// Liftoff: vertical accel (Y axis) exceeds this threshold (m/s^2)
-// 5G -> mps2. Tune if needed.
-static constexpr float kLiftoffAccelMs2 = 49.05f;
+static constexpr float    kLiftoffAccelMs2   = 49.0f;   // 5G — liftoff detect
+static constexpr float    kBurnoutAccelMs2   = 2.0f;    // near-zero net accel
+static constexpr uint32_t kBurnoutBackstopMs = 6000;    // 4s burn + 2s margin
 
-// Burnout: vertical accel drops below this (motor off, ~0G net)
-// Using 0 m/s^2 — gravity is already removed by BNO055 linear accel
-static constexpr float kBurnoutAccelMs2 = 2.0f;
-
-// Burnout backstop: if still in BOOST after this many ms, force transition
-static constexpr uint32_t kBurnoutBackstopMs = 6000;  // 4s burn + 2s margin
-
-// Apogee / descent detection: altitude must be falling by this much per sample
-static constexpr float kDescentThresholdM = -1.0f;
+// ─── Barometer timing ─────────────────────────────────────────────────────────
+// BMP280 runs at ~80 Hz. Track last read time to flag fresh baro data
+// for the Kalman update step.
+static constexpr uint32_t kBaroPeriodMs = 13;   // ~80 Hz = 12.5 ms, use 13
+static uint32_t lastBaroMs = 0;
 
 // ─── Flight state machine ─────────────────────────────────────────────────────
 
 enum class FlightState {
-    PAD,        // Sitting on launch pad. Waiting for liftoff.
-    BOOST,      // Motor burning. CAS locked neutral per 7.4.1.
-    COAST,      // Motor out. Airbrakes may deploy if conditions met.
-    DESCENDED   // Below deployment alt after apogee. Airbrakes retracted.
+    PAD,        // On launch pad. Waiting for liftoff.
+    BOOST,      // Motor burning. CAS locked neutral per IREC 7.4.1.
+    COAST,      // Motor out. Airbrakes may deploy if all conditions met.
+    DESCENDED   // Past apogee, below lockout altitude. Flight over.
 };
 
-static FlightState state          = FlightState::PAD;
-static uint32_t    boostStartMs   = 0;
-static bool        airbrakeOut    = false;
-static float       lastAltM       = 0.0f;
+static FlightState state        = FlightState::PAD;
+static uint32_t    boostStartMs = 0;
+static bool        airbrakeOut  = false;
+static float       lastAltM     = 0.0f;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -86,7 +73,6 @@ static const char* stateLabel(FlightState s)
     return "UNKNOWN";
 }
 
-/** Retract airbrakes and update flag. */
 static void retractAirbrakes(const char* reason)
 {
     if (airbrakeOut) {
@@ -96,7 +82,6 @@ static void retractAirbrakes(const char* reason)
     }
 }
 
-/** Deploy airbrakes and update flag. */
 static void deployAirbrakes()
 {
     if (!airbrakeOut) {
@@ -105,41 +90,6 @@ static void deployAirbrakes()
         Serial.println("[CTRL] Airbrakes DEPLOYED");
     }
 }
-
-#ifdef ENABLE_OTA
-static void initOTA()
-{
-    WiFi.mode(WIFI_STA);
-
-    WiFi.begin("Raymann", "Flerds@1!");
-
-    Serial.print("[OTA] Connecting WiFi");
-
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-        delay(250);
-        Serial.print(".");
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\n[OTA] WiFi failed — OTA disabled");
-        otaEnabled = false;
-        return;
-    }
-
-    // 🔑 DHCP-assigned IP (this is what matters now)
-    Serial.printf("\n[OTA] Connected\n");
-    Serial.printf("[OTA] IP address: %s\n", WiFi.localIP().toString().c_str());
-
-    ArduinoOTA.setHostname("esp32-flight");
-    ArduinoOTA.setPassword("Flerds@1!");
-
-    ArduinoOTA.begin();
-    otaEnabled = true;
-
-    Serial.println("[OTA] Ready");
-}
-#endif
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
 
@@ -158,7 +108,7 @@ void setup()
         while (true) { delay(1000); }
     }
 
-    // bar_init() owns Wire1.begin(18, 19) — must run before servo_init()
+    // bar_init() owns Wire1.begin(18,19) — must run before servo_init()
     if (!bar_init()) {
         Serial.println("[MAIN] BMP280 init failed, halting.");
         while (true) { delay(1000); }
@@ -177,13 +127,16 @@ void setup()
         while (true) { delay(1000); }
     }
 
-    #ifdef ENABLE_OTA
-    initOTA();
-    #endif
-
-    // 7.3.1 — ensure neutral state at boot
+    // 7.3.1 — ensure neutral state at boot before anything else
     servo_set_angle(kServoChannel, kNeutralAngle);
     airbrakeOut = false;
+
+    // Initialise Kalman filter with current AGL altitude (should be ~0 on pad)
+    float initAlt = bar_get_altitude_agl();
+    kf_init(initAlt);
+
+    lastLoopMs = millis();
+    lastBaroMs = millis();
 
     Serial.println("[MAIN] System ready — waiting for liftoff.");
 }
@@ -194,116 +147,148 @@ void loop()
 {
     transmitterPoll();
 
-    #ifdef ENABLE_OTA
-    if (otaEnabled) ArduinoOTA.handle();
-    #endif
+    // ── Timing ────────────────────────────────────────────────────────────────
+    uint32_t now  = millis();
+    float    dt_s = (now - lastLoopMs) / 1000.0f;
+    lastLoopMs    = now;
 
-    // ── Sensor reads ──────────────────────────────────────────────────────────
-    float temp, pressure, altAGL;
-    bool barOk = bar_read_all(temp, pressure, altAGL);
-
+    // ── IMU read (every loop — BNO055 updates at up to 100 Hz) ───────────────
     ImuSample imu;
     bool imuOk = imuRead(imu);
+
+    // ── Barometer read (flagged fresh at ~80 Hz) ──────────────────────────────
+    float temp, pressure, baroAlt;
+    bool barOk    = false;
+    bool baroFresh = (now - lastBaroMs) >= kBaroPeriodMs;
+
+    if (baroFresh) {
+        barOk      = bar_read_all(temp, pressure, baroAlt);
+        lastBaroMs = now;
+    }
+
+    // ── Kalman filter update ──────────────────────────────────────────────────
+    // Run every loop using IMU accel as the physics input (predict step).
+    // Baro corrects the estimate only when a fresh reading is available (update step).
+    // If IMU is unavailable, pass 0.0f — filter coasts on kinematics only.
+    float accelInput = imuOk ? imu.accel_y : 0.0f;
+    float baroInput  = barOk ? baroAlt     : lastAltM;
+
+    KfState kf = kf_update(baroInput, accelInput, barOk && baroFresh, dt_s);
+
+    // kf.altitude_m  = best estimate of altitude AGL (metres)
+    // kf.velocity_ms = best estimate of vertical velocity (m/s, + = up)
 
     // ── State machine ─────────────────────────────────────────────────────────
     switch (state) {
 
         // ── PAD: wait for liftoff ─────────────────────────────────────────────
         case FlightState::PAD:
-            // Airbrakes always neutral on pad
             retractAirbrakes("PAD state");
 
+            // Liftoff detected when vertical accel exceeds 5G (49 m/s²)
             if (imuOk && imu.accel_y >= kLiftoffAccelMs2) {
-                state       = FlightState::BOOST;
+                state        = FlightState::BOOST;
                 boostStartMs = millis();
-                Serial.printf("[SM] PAD → BOOST (accel_y=%.2f m/s²)\n", imu.accel_y);
+                Serial.printf("[SM] PAD → BOOST (accel_y=%.1f m/s², kf_vel=%.1f m/s)\n",
+                              imu.accel_y, kf.velocity_ms);
             }
             break;
 
         // ── BOOST: motor burning, CAS locked neutral per IREC 7.4.1 ──────────
         case FlightState::BOOST:
-            // 7.4.1 — CAS must remain neutral during boost
             retractAirbrakes("BOOST phase");
-
             {
                 uint32_t burnElapsedMs = millis() - boostStartMs;
-                bool accelBurnout  = imuOk && (imu.accel_y < kBurnoutAccelMs2);
-                bool timerBurnout  = (burnElapsedMs >= kBurnoutBackstopMs);
+                bool accelBurnout = imuOk && (imu.accel_y < kBurnoutAccelMs2);
+                bool timerBurnout = (burnElapsedMs >= kBurnoutBackstopMs);
 
                 if (accelBurnout || timerBurnout) {
                     state = FlightState::COAST;
-                    Serial.printf("[SM] BOOST → COAST (%s, elapsed=%lums)\n",
+                    Serial.printf("[SM] BOOST → COAST (%s at %lums, alt=%.1fm vel=%.1fm/s)\n",
                                   accelBurnout ? "accel" : "timer",
-                                  (unsigned long)burnElapsedMs);
+                                  (unsigned long)burnElapsedMs,
+                                  kf.altitude_m, kf.velocity_ms);
                 }
             }
             break;
 
-        // ── COAST: all three IREC conditions enforced ─────────────────────────
+        // ── COAST: enforce all three IREC conditions ──────────────────────────
         case FlightState::COAST:
             {
-                // Evaluate all three deployment conditions
-                bool altOk    = barOk  && (altAGL >= kAltitudeLockoutM);   // 7.4.1.3.2
-                bool tiltOk   = imuOk  && (imu.tilt_deg <= kMaxTiltDeg);   // 7.3.1
-                bool deployAlt = barOk && (altAGL >= kDeployAltM);
+                float altNow = kf.altitude_m;   // use Kalman altitude
 
-                // 7.3.1 — if tilt exceeded, retract immediately regardless
+                // Condition 1 — IREC 7.4.1.3.2: must be above 2,000 m AGL
+                bool altOk   = (altNow >= kAltitudeLockoutM);
+
+                // Condition 2 — IREC 7.3.1: tilt must be within 30° of vertical
+                bool tiltOk  = imuOk && (imu.tilt_deg <= kMaxTiltDeg);
+
+                // Condition 3 — deployment altitude reached
+                bool deployOk = (altNow >= kDeployAltM);
+
+                // 7.3.1 — tilt exceeded: retract IMMEDIATELY, no exceptions
                 if (imuOk && !tiltOk) {
                     retractAirbrakes("tilt > 30deg");
                 }
-                // All three conditions met — deploy
-                else if (altOk && tiltOk && deployAlt && !airbrakeOut) {
+                // All three conditions satisfied — deploy
+                else if (altOk && tiltOk && deployOk && !airbrakeOut) {
                     deployAirbrakes();
                 }
-                // Hysteresis — retract if we drop below deploy altitude
-                else if (airbrakeOut && barOk &&
-                         altAGL <= (kDeployAltM - kDeployHysteresisM)) {
+                // Hysteresis retract
+                else if (airbrakeOut && altNow <= (kDeployAltM - kDeployHysteresisM)) {
                     retractAirbrakes("below deploy alt");
                 }
 
-                // Transition to DESCENDED once we drop below lockout altitude
-                // after having been above it (i.e., past apogee)
-                if (barOk && altAGL < kAltitudeLockoutM &&
-                    lastAltM >= kAltitudeLockoutM) {
+                // Transition to DESCENDED: back below lockout AND velocity negative
+                if (altNow < kAltitudeLockoutM &&
+                    lastAltM >= kAltitudeLockoutM &&
+                    kf.velocity_ms < 0.0f) {
                     retractAirbrakes("descended below lockout");
                     state = FlightState::DESCENDED;
-                    Serial.println("[SM] COAST → DESCENDED");
+                    Serial.printf("[SM] COAST → DESCENDED (alt=%.1fm vel=%.1fm/s)\n",
+                                  kf.altitude_m, kf.velocity_ms);
                 }
             }
             break;
 
-        // ── DESCENDED: flight over, stay neutral ──────────────────────────────
+        // ── DESCENDED: flight over ─────────────────────────────────────────────
         case FlightState::DESCENDED:
             retractAirbrakes("DESCENDED state");
             break;
     }
 
-    // Update last altitude for descent detection
-    if (barOk) lastAltM = altAGL;
+    lastAltM = kf.altitude_m;
 
     // ── Serial debug ──────────────────────────────────────────────────────────
-    if (barOk && imuOk) {
-        Serial.printf("[DATA] State=%-10s Alt=%.2fm Tilt=%.1f° AccY=%.2f AirbrakeOut=%d\n",
-                      stateLabel(state), altAGL, imu.tilt_deg, imu.accel_y,
-                      airbrakeOut ? 1 : 0);
-    }
+    Serial.printf(
+        "[DATA] %-10s | AltKF=%6.1fm BaroAlt=%6.1fm | VelKF=%6.1fm/s | "
+        "AccY=%6.1f Tilt=%5.1f° | Brake=%d\n",
+        stateLabel(state),
+        kf.altitude_m,
+        barOk ? baroAlt : -999.0f,
+        kf.velocity_ms,
+        imuOk ? imu.accel_y : -999.0f,
+        imuOk ? imu.tilt_deg : -999.0f,
+        airbrakeOut ? 1 : 0
+    );
 
     // ── Transmit at fixed interval ────────────────────────────────────────────
-    const uint32_t now = millis();
     if (now - lastTxMs < kTransmitIntervalMs) return;
     lastTxMs = now;
 
     String payload;
-    payload.reserve(128);
-    payload += "State: "    + String(stateLabel(state));
-    payload += ", AltAGL: " + String(barOk  ? altAGL        : -999.0f, 2);
-    payload += ", Tilt: "   + String(imuOk  ? imu.tilt_deg  : -999.0f, 2);
-    payload += ", AccY: "   + String(imuOk  ? imu.accel_y   : -999.0f, 2);
-    payload += ", Roll: "   + String(imuOk  ? imu.roll      : -999.0f, 2);
-    payload += ", Pitch: "  + String(imuOk  ? imu.pitch     : -999.0f, 2);
-    payload += ", Yaw: "    + String(imuOk  ? imu.yaw       : -999.0f, 2);
-    payload += ", Temp: "   + String(barOk  ? temp          : -999.0f, 2);
-    payload += ", Airbrake: " + String(airbrakeOut ? 1 : 0);
+    payload.reserve(160);
+    payload += "State: "     + String(stateLabel(state));
+    payload += ", AltKF: "   + String(kf.altitude_m,  2);
+    payload += ", VelKF: "   + String(kf.velocity_ms, 2);
+    payload += ", BaroAlt: " + String(barOk  ? baroAlt       : -999.0f, 2);
+    payload += ", AccY: "    + String(imuOk  ? imu.accel_y   : -999.0f, 2);
+    payload += ", Tilt: "    + String(imuOk  ? imu.tilt_deg  : -999.0f, 2);
+    payload += ", Roll: "    + String(imuOk  ? imu.roll      : -999.0f, 2);
+    payload += ", Pitch: "   + String(imuOk  ? imu.pitch     : -999.0f, 2);
+    payload += ", Yaw: "     + String(imuOk  ? imu.yaw       : -999.0f, 2);
+    payload += ", Temp: "    + String(barOk  ? temp          : -999.0f, 2);
+    payload += ", Airbrake: "+ String(airbrakeOut ? 1 : 0);
 
     transmitterSend(payload);
 }
