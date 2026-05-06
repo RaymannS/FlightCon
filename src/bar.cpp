@@ -58,10 +58,10 @@ bool bar_init(void)
     //   SAMPLING_X16, FILTER_X16, STANDBY_MS_500  (~26 Hz, smoother)
     _bmp.setSampling(
         Adafruit_BMP280::MODE_NORMAL,       // Continuous measurement
-        Adafruit_BMP280::SAMPLING_X2,       // Temperature oversampling x2
-        Adafruit_BMP280::SAMPLING_X4,       // Pressure oversampling x4 (~80Hz)
-        Adafruit_BMP280::FILTER_X4,         // Light IIR filter — Kalman handles rest
-        Adafruit_BMP280::STANDBY_MS_1       // 1ms standby — fastest available in BMP280 library
+        Adafruit_BMP280::SAMPLING_X16,       // Temperature oversampling x2
+        Adafruit_BMP280::SAMPLING_X16,       // Pressure oversampling x4 (~80Hz)
+        Adafruit_BMP280::FILTER_X16,         // Light IIR filter — Kalman handles rest
+        Adafruit_BMP280::STANDBY_MS_500       // 1ms standby — fastest available in BMP280 library
     );
 
     _initialised = true;

@@ -1,105 +1,136 @@
 /**
- * imu.cpp — BNO08x UART-RVC driver for ESP32 WROOM-32E
+ * imu.cpp — BNO055 I2C driver for ESP32
  *
- * Mode : UART-RVC (Robot Vacuum Cleaner) — simplest BNO08x output mode
- * Bus  : HardwareSerial1 on GPIO 25 (RX only — one wire from BNO08x TX)
- * Rate : 100 Hz fixed, 115200 baud fixed
+ * Sensor: Teyleten Robot BNO055 9-axis attitude sensor module
+ * Bus:    I2C on ESP32 GPIO21 SDA, GPIO22 SCL
  *
- * No library required. Parses the raw 19-byte UART-RVC packet directly.
- *
- * Hardware setup:
- *   GY-BNO08X PS0 jumper → SOLDERED CLOSED  (sets UART-RVC mode)
- *   GY-BNO08X PS1 jumper → OPEN             (must be unsoldered)
- *   BNO08x TX pin        → ESP32 GPIO 25
- *
- * UART-RVC packet (19 bytes, 100 Hz):
- *   [0]    0xAA  — header byte 1
- *   [1]    0xAA  — header byte 2
- *   [2-3]  Yaw       int16 LE  1/100 deg
- *   [4-5]  Pitch     int16 LE  1/100 deg
- *   [6-7]  Roll      int16 LE  1/100 deg
- *   [8-9]  Accel X   int16 LE  1/1000 g
- *   [10-11]Accel Y   int16 LE  1/1000 g
- *   [12-13]Accel Z   int16 LE  1/1000 g
- *   [14-18]reserved / status
- *
- * Acceleration units from chip: 1/1000 g (millig)
- * We convert to m/s² and subtract 1g from accel_y to remove gravity.
+ * This replaces the old BNO08x UART-RVC parser.
  */
 
 #include "imu.h"
+
 #include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
 #include <math.h>
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── I2C config ───────────────────────────────────────────────────────────────
 
-// Gravity constant for unit conversion (m/s²)
-static constexpr float kGravity = 9.80665f;
+static constexpr int kImuSdaPin = 21;
+static constexpr int kImuSclPin = 22;
 
-// UART-RVC packet size and header
-static constexpr uint8_t  kPacketLen    = 19;
-static constexpr uint8_t  kHeader1      = 0xAA;
-static constexpr uint8_t  kHeader2      = 0xAA;
+// Most BNO055 modules use 0x28.
+// If the IMU is not detected, try changing this to 0x29.
+static constexpr uint8_t kBno055Address = 0x28;
+
+// If your module acts weird or does not have an external 32.768 kHz crystal,
+// change this to false.
+static constexpr bool kUseExternalCrystal = true;
+
+// ─── Axis mapping ─────────────────────────────────────────────────────────────
+//
+// Your flight code expects:
+//   sample.accel_y = rocket vertical/body-axis acceleration, gravity removed.
+//
+// The BNO055 gives linear acceleration as sensor X/Y/Z.
+// Change these mappings if your physical mounting is different.
+//
+// Start with the board mounted so the BNO055 +Y axis points toward the rocket nose.
+// If lifting the rocket upward does not make AccY go positive, change the mapping.
+
+static constexpr int kRocketAxisX = 0;   // sensor X -> sample.accel_x
+static constexpr int kRocketAxisY = 1;   // sensor Y -> sample.accel_y
+static constexpr int kRocketAxisZ = 2;   // sensor Z -> sample.accel_z
+
+static constexpr float kRocketAxisXSign =  1.0f;
+static constexpr float kRocketAxisYSign =  1.0f;
+static constexpr float kRocketAxisZSign =  1.0f;
 
 // ─── Internal state ───────────────────────────────────────────────────────────
 
+static Adafruit_BNO055 bno = Adafruit_BNO055(55, kBno055Address, &Wire);
 static bool _ready = false;
-
-// Raw byte buffer — we accumulate bytes until we have a full packet
-static uint8_t  _buf[kPacketLen];
-static uint8_t  _bufIdx = 0;       // how many bytes collected so far
-static bool     _synced = false;   // true once we've found a 0xAA 0xAA header
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/**
- * Read a signed 16-bit integer from two bytes, little-endian.
- * buf[offset] = low byte, buf[offset+1] = high byte.
- */
-static int16_t _read_i16(const uint8_t *buf, uint8_t offset)
+static float _axisValue(const imu::Vector<3>& v, int axis)
 {
-    return (int16_t)((uint16_t)buf[offset] | ((uint16_t)buf[offset + 1] << 8));
+    switch (axis) {
+        case 0: return v.x();
+        case 1: return v.y();
+        case 2: return v.z();
+        default: return 0.0f;
+    }
 }
 
 /**
  * Compute tilt angle from vertical using pitch and roll.
  *
- * When the rocket is perfectly vertical, pitch = 0 and roll = 0.
- * We use the proper dot-product formula so it stays accurate at
- * large angles (not just a simple addition of pitch + roll).
- *
- *   cos(tilt) = cos(pitch) * cos(roll)
- *   tilt = acos( cos(pitch) * cos(roll) )
+ * When the rocket is vertical:
+ *   pitch ≈ 0
+ *   roll  ≈ 0
+ *   tilt  ≈ 0
  */
 static float _compute_tilt(float pitch_deg, float roll_deg)
 {
     float pitch_rad = pitch_deg * DEG_TO_RAD;
     float roll_rad  = roll_deg  * DEG_TO_RAD;
-    float cos_tilt  = cosf(pitch_rad) * cosf(roll_rad);
-    cos_tilt = constrain(cos_tilt, -1.0f, 1.0f);   // clamp for acos safety
+
+    float cos_tilt = cosf(pitch_rad) * cosf(roll_rad);
+    cos_tilt = constrain(cos_tilt, -1.0f, 1.0f);
+
     return acosf(cos_tilt) * RAD_TO_DEG;
 }
 
-// ─── Public implementation ────────────────────────────────────────────────────
+static void _printCalibration()
+{
+    uint8_t sys = 0;
+    uint8_t gyro = 0;
+    uint8_t accel = 0;
+    uint8_t mag = 0;
+
+    bno.getCalibration(&sys, &gyro, &accel, &mag);
+
+    Serial.printf("[IMU] Calibration SYS=%u GYRO=%u ACCEL=%u MAG=%u\n",
+                  sys, gyro, accel, mag);
+}
+
+// ─── Public implementation ───────────────────────────────────────────────────
 
 bool imuInit()
 {
-    // UART-RVC uses HardwareSerial1.
-    // GPIO 25 = RX (receives BNO08x TX stream)
-    // GPIO 26 = TX (unused — BNO08x doesn't need commands in RVC mode)
-    Serial1.begin(IMU_BAUD_RATE, SERIAL_8N1, IMU_RX_PIN, IMU_TX_PIN);
+    Wire.begin(kImuSdaPin, kImuSclPin);
+    Wire.setClock(400000);
 
-    // Flush any garbage bytes that arrived during power-up
-    delay(200);
-    while (Serial1.available()) Serial1.read();
+    delay(100);
 
-    _bufIdx = 0;
-    _synced = false;
-    _ready  = true;
+    if (!bno.begin()) {
+        Serial.println("[IMU] BNO055 not detected.");
+        Serial.println("[IMU] Check wiring:");
+        Serial.println("[IMU]   VIN/VCC -> 3.3V");
+        Serial.println("[IMU]   GND     -> GND");
+        Serial.println("[IMU]   SDA     -> GPIO21");
+        Serial.println("[IMU]   SCL     -> GPIO22");
+        Serial.println("[IMU] If wiring is correct, try changing kBno055Address from 0x28 to 0x29.");
+        _ready = false;
+        return false;
+    }
 
-    Serial.printf("[IMU] BNO08x UART-RVC ready (RX=GPIO%d, baud=%d)\n",
-                  IMU_RX_PIN, IMU_BAUD_RATE);
-    Serial.println("[IMU] Verify: PS0 soldered, PS1 open on GY-BNO08X board");
+    delay(1000);
+
+    bno.setExtCrystalUse(kUseExternalCrystal);
+
+    _ready = true;
+
+    Serial.printf("[IMU] BNO055 ready on I2C address 0x%02X\n", kBno055Address);
+    Serial.printf("[IMU] SDA=GPIO%d, SCL=GPIO%d\n", kImuSdaPin, kImuSclPin);
+    Serial.println("[IMU] Linear acceleration is gravity-removed.");
+    Serial.println("[IMU] Make sure accel_y is your rocket vertical/body axis.");
+
+    _printCalibration();
+
     return true;
 }
 
@@ -109,73 +140,30 @@ bool imuRead(ImuSample &sample)
 {
     if (!_ready) return false;
 
-    // Process all bytes currently in the UART receive buffer.
-    // We don't block — if a full packet isn't here yet, return false
-    // and the caller will try again next loop iteration.
-    while (Serial1.available()) {
-        uint8_t byte = (uint8_t)Serial1.read();
+    // BNO055 Euler vector:
+    //   x = heading/yaw
+    //   y = roll
+    //   z = pitch
+    imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
 
-        if (!_synced) {
-            // ── Header sync ──────────────────────────────────────────────────
-            // Scan incoming bytes until we see 0xAA followed by 0xAA.
-            // This aligns us to packet boundaries after power-on or glitches.
-            if (_bufIdx == 0 && byte == kHeader1) {
-                _buf[_bufIdx++] = byte;   // got first header byte
-            } else if (_bufIdx == 1 && byte == kHeader2) {
-                _buf[_bufIdx++] = byte;   // got second header byte — synced!
-                _synced = true;
-            } else {
-                // Not a valid header sequence — reset and keep scanning
-                _bufIdx = 0;
-            }
-        } else {
-            // ── Collect packet bytes ─────────────────────────────────────────
-            // We already have the two header bytes; collect the remaining
-            // (kPacketLen - 2) data bytes.
-            _buf[_bufIdx++] = byte;
+    // BNO055 linear acceleration:
+    //   acceleration with gravity removed, units = m/s²
+    imu::Vector<3> linAccel = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
 
-            if (_bufIdx == kPacketLen) {
-                // ── Full packet received — parse it ───────────────────────────
-                // Reset for next packet
-                _bufIdx = 0;
-                _synced = false;
+    // Orientation
+    sample.yaw   = euler.x();
+    sample.roll  = euler.y();
+    sample.pitch = euler.z();
 
-                // ── Parse Euler angles ────────────────────────────────────────
-                // Raw values are in 1/100 degree units — divide by 100.0
-                // Bytes 2-3: Yaw, 4-5: Pitch, 6-7: Roll
-                sample.yaw   = _read_i16(_buf, 2) / 100.0f;   // degrees
-                sample.pitch = _read_i16(_buf, 4) / 100.0f;   // degrees
-                sample.roll  = _read_i16(_buf, 6) / 100.0f;   // degrees
+    // Acceleration axis mapping
+    sample.accel_x = kRocketAxisXSign * _axisValue(linAccel, kRocketAxisX);
+    sample.accel_y = kRocketAxisYSign * _axisValue(linAccel, kRocketAxisY);
+    sample.accel_z = kRocketAxisZSign * _axisValue(linAccel, kRocketAxisZ);
 
-                // ── Parse acceleration ────────────────────────────────────────
-                // Raw values are in 1/1000 g units — convert to m/s²
-                // Bytes 8-9: X, 10-11: Y, 12-13: Z
-                float raw_ax = _read_i16(_buf,  8) / 1000.0f * kGravity;
-                float raw_ay = _read_i16(_buf, 10) / 1000.0f * kGravity;
-                float raw_az = _read_i16(_buf, 12) / 1000.0f * kGravity;
+    // Tilt safety value used by your state machine
+    sample.tilt_deg = _compute_tilt(sample.pitch, sample.roll);
 
-                // ── Remove gravity from vertical axis ─────────────────────────
-                // UART-RVC accel INCLUDES gravity. When the rocket is vertical
-                // and stationary, accel_y reads ~+9.81 m/s² (1g, nose up).
-                // We subtract 1g so that at rest accel_y ≈ 0 m/s².
-                // This matches the Kalman filter and liftoff detection expectations.
-                //
-                // If your board is mounted with Y pointing TAIL-ward (downward),
-                // change this to: raw_ay + kGravity
-                sample.accel_x = raw_ax;
-                sample.accel_y = raw_ay - kGravity;   // gravity removed --- IF IT READS 9.81 THEN DO + GRAVITY
-                sample.accel_z = raw_az;
-
-                // ── Tilt from vertical ────────────────────────────────────────
-                sample.tilt_deg = _compute_tilt(sample.pitch, sample.roll);
-
-                return true;   // valid packet parsed
-            }
-        }
-    }
-
-    // No complete packet available yet — caller should try next loop
-    return false;
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

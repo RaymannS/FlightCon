@@ -32,54 +32,62 @@
  *   KF_Q_ALTITUDE  — process noise for altitude state
  *   KF_Q_VELOCITY  — process noise for velocity state
  *
- * Rule of thumb: set Q_VELOCITY ≈ (max expected acceleration uncertainty)^2 * dt
- * For a rocket with ~130 m/s² peak accel, start around 0.5–2.0.
+ * Without IMU: keep Q_VELOCITY LOW (0.1) — no accel input means velocity
+ * is derived purely from baro changes, so we want it to be conservative.
+ * With IMU: raise Q_VELOCITY to 1.0–5.0 to let accel drive velocity fast.
  *
  * --- R (Measurement Noise) ---
  * Represents how much you DISTRUST the barometer reading.
- * Higher R = filter trusts IMU more, ignores baro more.
- * Lower R  = filter trusts baro more, follows it closely.
+ * Higher R = filter trusts the physics model more, smoother but slower.
+ * Lower R  = filter follows baro closely, noisier output.
  *
  *   KF_R_ALTITUDE  — barometer measurement noise variance (metres^2)
  *
- * Rule of thumb: take 100 baro readings at rest, compute variance. 
- * For BMP280 at ~80Hz with X4 oversampling, expect ~0.5–2.0 m² variance.
- * Set KF_R_ALTITUDE to that measured variance.
+ * Rule of thumb: take 100 baro readings at rest, compute variance.
+ * For BMP280 at ~80Hz with X4 oversampling, measure ~2.0–5.0 m² variance.
+ * Set KF_R_ALTITUDE to your measured variance.
+ *
+ * --- Baro-only vs IMU+Baro tuning ---
+ *
+ *   BARO ONLY (IMU unavailable):
+ *     KF_Q_ALTITUDE = 0.05
+ *     KF_Q_VELOCITY = 0.1    ← low: velocity estimated from baro only
+ *     KF_R_ALTITUDE = 4.0    ← high: baro is noisy at X4 oversampling
+ *
+ *   IMU + BARO (normal flight):
+ *     KF_Q_ALTITUDE = 0.1
+ *     KF_Q_VELOCITY = 1.0    ← higher: IMU drives velocity estimate
+ *     KF_R_ALTITUDE = 1.0    ← lower: IMU anchors altitude well
  *
  * --- Tuning procedure ---
- * 1. Log raw baro altitude and raw accel_y to your database during a static test.
- * 2. Compute variance of baro altitude while stationary → set KF_R_ALTITUDE.
- * 3. Start with KF_Q_VELOCITY = 1.0, KF_Q_ALTITUDE = 0.1.
- * 4. If filtered altitude lags behind real events → increase Q values.
- * 5. If filtered altitude is noisy → decrease Q values or increase R.
- * 6. Compare filtered velocity to finite-difference of baro altitude post-flight.
- *    They should agree in trend but filtered should be much smoother.
+ * 1. Log raw baro altitude to your database while stationary for 30 seconds.
+ * 2. Compute variance of those readings → set KF_R_ALTITUDE to that value.
+ * 3. If filtered altitude is still jumpy → increase KF_R_ALTITUDE.
+ * 4. If filtered altitude lags real movement → decrease KF_R_ALTITUDE.
+ * 5. If velocity drifts while stationary → decrease KF_Q_VELOCITY.
+ * 6. When IMU arrives: decrease KF_R_ALTITUDE, increase KF_Q_VELOCITY.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * IMU MOUNTING NOTE
  * ═══════════════════════════════════════════════════════════════════════════
- * The filter uses accel_y from the BNO055 as the vertical acceleration input.
+ * The filter uses accel_y from the BNO08x as the vertical acceleration input.
  * This assumes:
- *   - The BNO055 Y axis points ALONG the rocket body axis (nose-to-tail)
+ *   - The BNO08x Y axis points ALONG the rocket body axis (nose-to-tail)
  *   - Positive Y = toward nose = upward when rocket is vertical
- *   - The BNO055 is mounted FLAT on your PCB with the Y silkscreen label
- *     aligned with the rocket's long axis
- *   - The BNO055 gravity compensation is active (LINEAR_ACCEL vector used,
- *     NOT raw accelerometer) so accel_y = 0 when rocket is stationary
+ *   - accel_y already has gravity removed (done in imu.cpp)
+ *   - At rest on pad: accel_y ≈ 0 m/s²
  *
- * If your board is mounted differently (Y axis horizontal, Z vertical, etc.),
- * change kf_update() to use the correct axis from ImuSample.
+ * If your board is mounted differently, update imu.cpp to use the correct axis.
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
 // ─── Tuning constants ─────────────────────────────────────────────────────────
+// Currently set for BARO-ONLY operation (no IMU).
+// When IMU arrives: set KF_Q_VELOCITY = 1.0, KF_R_ALTITUDE = 1.0
 
-// Process noise — how much we distrust the physics model per step
-#define KF_Q_ALTITUDE   0.1f    // metres^2   — altitude process noise
-#define KF_Q_VELOCITY   1.0f    // (m/s)^2    — velocity process noise
-
-// Measurement noise — how much we distrust the barometer
-#define KF_R_ALTITUDE   1.0f    // metres^2   — baro noise variance
+#define KF_Q_ALTITUDE   0.05f   // metres^2    — altitude process noise
+#define KF_Q_VELOCITY   0.1f    // (m/s)^2     — velocity process noise (low = stable without IMU)
+#define KF_R_ALTITUDE   4.0f    // metres^2    — baro noise variance (measure and tune this)
 
 // ─── Output structure ─────────────────────────────────────────────────────────
 
@@ -93,20 +101,18 @@ struct KfState {
 /**
  * @brief  Initialise the Kalman filter.
  *         Call once after bar_calibrate() so the initial altitude is valid.
- * @param  initial_alt_m   Starting altitude AGL in metres (use bar_get_altitude_agl())
+ * @param  initial_alt_m   Starting altitude AGL in metres
  */
 void kf_init(float initial_alt_m);
 
 /**
- * @brief  Run one filter cycle. Call every loop iteration.
- *
- *         The filter runs in two steps:
- *           1. PREDICT — uses IMU accel to propagate state forward by dt
- *           2. UPDATE  — corrects with barometer reading (when available)
+ * @brief  Run one filter cycle. Only call when barometer has fresh data.
+ *         When IMU is unavailable pass accel_y_ms2 = 0.0f and
+ *         set baro_fresh = true only when a new baro reading exists.
  *
  * @param  baro_alt_m   Barometer altitude AGL in metres
- * @param  accel_y_ms2  Vertical linear acceleration from BNO055 (m/s^2, gravity removed)
- * @param  baro_fresh   true if the barometer has a new reading this cycle
+ * @param  accel_y_ms2  Vertical linear acceleration (m/s^2, gravity removed)
+ * @param  baro_fresh   true if barometer has a new reading this cycle
  * @param  dt_s         Time since last call in seconds
  * @return KfState      Current best estimate of altitude and velocity
  */
