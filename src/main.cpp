@@ -30,9 +30,15 @@ static constexpr float kDeployHysteresisM = 5.0f;
 
 // ─── Liftoff / burnout detection ─────────────────────────────────────────────
 // 550 lb thrust / 42 lb rocket = ~13G off pad.
-// Liftoff threshold = 5G (49 m/s²).
-// accel_y has gravity removed so reads ~0 m/s² at rest.
-static constexpr float    kLiftoffAccelMs2   = 49.0f;   // 5G
+//
+// BNO055 in fusion mode clips at ~4G (39.2 m/s²) so we cannot use a 5G
+// threshold directly. Instead we use a dual confirm:
+//   1. IMU accel_y exceeds 2G (19.6 m/s²) — below clip limit, reliable
+//   2. Baro altitude has risen at least 20m above launch altitude
+// Both must be true simultaneously to trigger PAD -> BOOST.
+// This prevents false triggers from pad bumps (IMU alone) or baro noise (baro alone).
+static constexpr float    kLiftoffAccelMs2   = 20.0f;   // 2G — below BNO055 4G clip limit
+static constexpr float    kLiftoffAltM       = 20.0f;   // metres AGL — baro confirm
 static constexpr float    kBurnoutAccelMs2   = 2.0f;    // near-zero = motor out
 static constexpr uint32_t kBurnoutBackstopMs = 6000;    // 4s burn + 2s margin
 
@@ -61,7 +67,8 @@ enum class FlightState {
     DESCENDED    // On the ground. Flight over. Velocity forced to zero (ZUPT).
 };
 
-static FlightState state        = FlightState::PAD;
+// TODO: change back to FlightState::PAD before flight
+static FlightState state        = FlightState::COAST;
 static uint32_t    boostStartMs = 0;
 static bool        airbrakeOut  = false;
 static float       lastAltM     = 0.0f;
@@ -217,13 +224,22 @@ void loop()
     switch (state) {
 
         // ── PAD: wait for liftoff ─────────────────────────────────────────────
+        // Dual confirm required:
+        //   1. IMU accel_y >= 2G (19.6 m/s2) — below BNO055 4G fusion clip
+        //   2. Kalman altitude >= 20m AGL — baro confirmation
+        // Both must be true simultaneously to prevent false triggers.
         case FlightState::PAD:
             retractAirbrakes("PAD state");
-            if (imuOk && imu.accel_y >= kLiftoffAccelMs2) {
-                state        = FlightState::BOOST;
-                boostStartMs = millis();
-                Serial.printf("[SM] PAD -> BOOST (accel_y=%.1f m/s² vel=%.1f m/s)\n",
-                              imu.accel_y, lastKf.velocity_ms);
+            {
+                bool accelTriggered = imuOk && (imu.accel_y >= kLiftoffAccelMs2);
+                bool baroTriggered  = (lastKf.altitude_m >= kLiftoffAltM);
+
+                if (accelTriggered && baroTriggered) {
+                    state        = FlightState::BOOST;
+                    boostStartMs = millis();
+                    Serial.printf("[SM] PAD -> BOOST (accel_y=%.1f m/s2 alt=%.1fm vel=%.1fm/s)\n",
+                                  imu.accel_y, lastKf.altitude_m, lastKf.velocity_ms);
+                }
             }
             break;
 
