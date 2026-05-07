@@ -85,9 +85,9 @@
 // Currently set for BARO-ONLY operation (no IMU).
 // When IMU arrives: set KF_Q_VELOCITY = 1.0, KF_R_ALTITUDE = 1.0
 
-#define KF_Q_ALTITUDE   0.05f   // metres^2    — altitude process noise
-#define KF_Q_VELOCITY   0.1f    // (m/s)^2     — velocity process noise (low = stable without IMU)
-#define KF_R_ALTITUDE   4.0f    // metres^2    — baro noise variance (measure and tune this)
+#define KF_Q_ALTITUDE   0.01f   // metres^2    — altitude process noise
+#define KF_Q_VELOCITY   0.01f    // (m/s)^2     — velocity process noise (low = stable without IMU)
+#define KF_R_ALTITUDE   15.0f   // metres^2    — baro noise variance (measure and tune this)
 
 // ─── Output structure ─────────────────────────────────────────────────────────
 

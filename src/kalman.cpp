@@ -128,7 +128,23 @@ KfState kf_update(float baro_alt_m,
     float dt2 = dt_s * dt_s;   // dt squared — used in altitude update
 
     float x0_pred = x[0] + x[1]*dt_s + 0.5f*accel_y_ms2*dt2;  // altitude
-    float x1_pred = x[1] + accel_y_ms2*dt_s;                    // velocity
+
+    // Velocity predict with damping.
+    // kVelDecay < 1.0 means velocity bleeds toward zero each step
+    // unless real acceleration is actively driving it.
+    //
+    // This prevents baro noise from freely integrating into velocity
+    // when no IMU accel input is available (accel_y_ms2 = 0.0f).
+    //
+    // Tuning:
+    //   0.99 = very light damping, velocity takes ~4s to halve at 40Hz
+    //   0.97 = moderate damping, velocity halves in ~1.5s at 40Hz  <- current
+    //   0.95 = aggressive damping, velocity halves in ~0.8s at 40Hz
+    //
+    // When IMU is re-enabled for flight, keep at 0.97 — during boost the
+    // accel input (130+ m/s²) overwhelms the tiny decay term completely.
+    static constexpr float kVelDecay = 0.97f;
+    float x1_pred = x[1] * kVelDecay + accel_y_ms2*dt_s;       // velocity
 
     // ── Covariance predict: P_pred = F*P*F' + Q ──────────────────────────────
     //
