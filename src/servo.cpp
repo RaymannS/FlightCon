@@ -47,7 +47,7 @@ bool servo_init(uint8_t sda, uint8_t scl)
 {
     // Initialize Wire1 (second I2C port) on pins 18/19, shared with BMP280
     // Both devices have different addresses: servo at 0x40, BMP280 at 0x76
-    Wire1.begin(sda, scl);
+    // Wire1.begin(sda, scl);
 
     _pca9685.begin();
 

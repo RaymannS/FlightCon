@@ -131,7 +131,7 @@ bool sendMessage(int address, String message) {
   // AT command format: AT+SEND=[Address],[Payload Length],[Payload]
   String atCommand = "AT+SEND=" + String(address) + "," + String(message.length()) + "," + message;
   
-  Serial.println("Transmitting to address " + String(address) + ": " + message);
+  // Serial.println("Transmitting to address " + String(address) + ": " + message);
   loraSerial.println(atCommand);
   
   String response = readModuleResponse(1200);
@@ -141,7 +141,7 @@ bool sendMessage(int address, String message) {
   }
 
   if (response.indexOf("+OK") >= 0 || response == "OK") {
-    Serial.println("Message sent successfully!");
+    // Serial.println("Message sent successfully!");
     return true;
   } else {
     Serial.println("Transmission failed: " + response);
