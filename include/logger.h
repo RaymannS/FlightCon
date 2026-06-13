@@ -6,7 +6,7 @@
 // is readable via HTTP during the WiFi window before logging begins.
 void logger_mount_fs();
 
-// Allocate PSRAM buffer (or open LittleFS file) and begin recording.
+// Open /flight.log for writing and begin recording.
 // Call after the WiFi window closes so a new flight never overwrites an
 // undownloaded log. Without ENABLE_OTA, call this directly in setup().
 void logger_init();

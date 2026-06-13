@@ -44,7 +44,7 @@ static constexpr bool kUseExternalCrystal = false;
 static constexpr uint32_t kImuI2cClockHz = 100000;
 
 // Keep debug logging from overwhelming the UART when imuRead() runs fast.
-static constexpr uint32_t kImuDebugPrintPeriodMs = 500;
+static constexpr uint32_t kImuDebugPrintPeriodMs = 1000;
 static constexpr uint32_t kImuZeroStallMs = 1500;
 static constexpr float kImuZeroEpsilon = 0.05f;
 
@@ -55,9 +55,10 @@ static constexpr float kImuZeroEpsilon = 0.05f;
 static constexpr int   kRocketAxisX     =  0;
 static constexpr int   kRocketAxisY     =  1;    // vertical axis — Kalman input
 static constexpr int   kRocketAxisZ     =  2;
-static constexpr float kRocketAxisXSign =  1.0f;
-static constexpr float kRocketAxisYSign =  1.0f; // flip to -1.0f if needed
-static constexpr float kRocketAxisZSign =  1.0f;
+static constexpr float kRocketAxisXSign    =  1.0f;
+static constexpr float kRocketAxisYSign    =  1.0f; // flip to -1.0f if needed
+static constexpr float kRocketAxisZSign    =  1.0f;
+static constexpr float kPitchMountOffsetDeg = 90.0f; // IMU mounted 90° nose-down
 
 // ─── EEPROM / flash calibration storage ──────────────────────────────────────
 // Layout:
@@ -204,9 +205,9 @@ static bool _readOrientationFromQuat(ImuSample& sample)
     q.z() = -q.z();
 
     imu::Vector<3> euler = q.toEuler();
-    sample.yaw   = -euler.z() * RAD_TO_DEG;
+    sample.pitch = -euler.z() * RAD_TO_DEG;
     sample.roll  = -euler.x() * RAD_TO_DEG;
-    sample.pitch = -euler.y() * RAD_TO_DEG;
+    sample.yaw   = -euler.y() * RAD_TO_DEG;
     return true;
 }
 
@@ -217,9 +218,9 @@ static void _readOrientationFromEuler(ImuSample& sample)
     //   y = roll           (+-180 deg)
     //   z = pitch          (+-90 deg)
     imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
-    sample.yaw   = euler.x();
+    sample.pitch = euler.x();
     sample.roll  = euler.y();
-    sample.pitch = euler.z();
+    sample.yaw   = euler.z();
 }
 
 static void _restoreLastGoodOrientation(ImuSample& sample)
@@ -270,6 +271,7 @@ static void _readImuIntoSample(ImuSample& sample)
     sample.accel_y = kRocketAxisYSign * _axisValue(linAccel, kRocketAxisY);
     sample.accel_z = kRocketAxisZSign * _axisValue(linAccel, kRocketAxisZ);
 
+    sample.pitch += kPitchMountOffsetDeg;
     sample.tilt_deg = _compute_tilt(sample.pitch, sample.roll);
 }
 
