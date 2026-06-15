@@ -1,4 +1,5 @@
 #include "servo.h"
+#include "verbose.h"
 
 // ─── Internal State ──────────────────────────────────────────────────────────
 
@@ -47,7 +48,7 @@ bool servo_init(uint8_t sda, uint8_t scl)
 {
     // Initialize Wire1 (second I2C port) on pins 18/19, shared with BMP280
     // Both devices have different addresses: servo at 0x40, BMP280 at 0x76
-    Wire1.begin(sda, scl);
+    // Wire1.begin(sda, scl);
 
     _pca9685.begin();
 
@@ -70,8 +71,8 @@ bool servo_init(uint8_t sda, uint8_t scl)
     }
 
     _initialised = true;
-    Serial.printf("[servo] PCA9685 ready — SDA:%d SCL:%d addr:0x%02X freq:%dHz\n",
-                  sda, scl, PCA9685_I2C_ADDR, SERVO_FREQ_HZ);
+    VLOGF("[servo] PCA9685 ready — SDA:%d SCL:%d addr:0x%02X freq:%dHz\n",
+          sda, scl, PCA9685_I2C_ADDR, SERVO_FREQ_HZ);
     return true;
 }
 
@@ -95,7 +96,7 @@ void servo_set_angle(uint8_t channel, float degrees)
     uint16_t tick = _angle_to_tick(degrees);
     _pca9685.setPWM(channel, 0, tick);
 
-    Serial.printf("[servo] ch%02d → %.1f° (tick %d)\n", channel, degrees, tick);
+    VLOGF("[servo] ch%02d → %.1f° (tick %d)\n", channel, degrees, tick);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ void servo_set_pulse_us(uint8_t channel, uint16_t pulse_us)
     uint16_t tick = _us_to_tick(pulse_us);
     _pca9685.setPWM(channel, 0, tick);
 
-    Serial.printf("[servo] ch%02d → %dµs (tick %d)\n", channel, pulse_us, tick);
+    VLOGF("[servo] ch%02d → %dµs (tick %d)\n", channel, pulse_us, tick);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,7 +133,7 @@ void servo_release(uint8_t channel)
     if (channel >= SERVO_CHANNEL_COUNT) return;
 
     _pca9685.setPWM(channel, 0, 0);
-    Serial.printf("[servo] ch%02d released\n", channel);
+    VLOGF("[servo] ch%02d released\n", channel);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +143,7 @@ void servo_release_all()
     for (uint8_t ch = 0; ch < SERVO_CHANNEL_COUNT; ch++) {
         servo_release(ch);
     }
-    Serial.println("[servo] all channels released");
+    VLOG("[servo] all channels released");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,8 +160,8 @@ void servo_sweep(uint8_t  channel,
     uint32_t step_delay_ms = duration_ms / steps;
     float    delta         = (to_deg - from_deg) / (float)steps;
 
-    Serial.printf("[servo] ch%02d sweep %.1f° → %.1f° over %lums (%d steps)\n",
-                  channel, from_deg, to_deg, duration_ms, steps);
+    VLOGF("[servo] ch%02d sweep %.1f° → %.1f° over %lums (%d steps)\n",
+          channel, from_deg, to_deg, duration_ms, steps);
 
     for (uint16_t i = 0; i <= steps; i++) {
         float angle = from_deg + delta * (float)i;

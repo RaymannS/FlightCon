@@ -105,6 +105,36 @@
 				"$platformio"
 			],
 			"group": "build"
+		},
+		{
+			"label": "build esp32deb OTA AP",
+			"type": "shell",
+			"command": "/Users/rylandedwards/.platformio/penv/bin/platformio",
+			"args": [
+				"run",
+				"--environment",
+				"esp32deb_OTA"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "build esp32deb OTA wifi timeout",
+			"type": "shell",
+			"command": "/Users/rylandedwards/.platformio/penv/bin/platformio",
+			"args": [
+				"run",
+				"--environment",
+				"esp32deb_OTA"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
 		}
 	]
 }

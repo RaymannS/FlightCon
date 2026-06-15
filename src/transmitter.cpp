@@ -2,6 +2,7 @@
 // Hardware Serial2 is used for LoRa communication
 #include <Arduino.h>
 #include "transmitter.h"
+#include "verbose.h"
 HardwareSerial loraSerial(2);
 
 // Pin definitions for ESP32 WROVER-E
@@ -12,18 +13,120 @@ HardwareSerial loraSerial(2);
 
 // These values must match the receiver/Raspberry Pi side.
 #define LORA_BAUD_RATE 115200
+#define LORA_CRFOP 22   // max output power (dBm); RYLR998 range is -9 to 22
 #define LORA_BAND 915000000
 #define NETWORK_ID 1
 #define DEVICE_ADDRESS 6
 #define TARGET_ADDRESS 2
 
 String readModuleResponse(uint32_t timeoutMs = 1000);
-bool sendATCommand(String command, uint32_t timeoutMs = 1000);
+bool sendATCommand(String command, uint32_t timeoutMs = 1000, bool expectOk = true);
 bool sendMessage(int address, String message);
 void checkForMessages();
 
+static String sRxLine;
+static bool sDeployCommandPending = false;
+
+static bool isDeployCommand(const String& payload)
+{
+  String cmd = payload;
+  cmd.trim();
+  cmd.toUpperCase();
+  return cmd == "DEPLOY_AIRBRAKE" || cmd == "DEPLOY" || cmd == "AIRBRAKE_DEPLOY";
+}
+
+static bool parseRcvFrame(const String& frame, String& senderAddress, String& messageData, String& rssi, String& snr)
+{
+  if (!frame.startsWith("+RCV=")) {
+    return false;
+  }
+
+  int firstComma = frame.indexOf(',');
+  int secondComma = frame.indexOf(',', firstComma + 1);
+  int thirdComma = frame.indexOf(',', secondComma + 1);
+  int fourthComma = frame.indexOf(',', thirdComma + 1);
+
+  if (firstComma <= 0 || secondComma <= 0 || thirdComma <= 0 || fourthComma <= 0) {
+    return false;
+  }
+
+  senderAddress = frame.substring(5, firstComma);
+  messageData = frame.substring(secondComma + 1, thirdComma);
+  rssi = frame.substring(thirdComma + 1, fourthComma);
+  snr = frame.substring(fourthComma + 1);
+  senderAddress.trim();
+  messageData.trim();
+  rssi.trim();
+  snr.trim();
+  return true;
+}
+
+static void handleIncomingLine(const String& line)
+{
+  if (line.length() == 0) {
+    return;
+  }
+
+  String senderAddress;
+  String messageData;
+  String rssi;
+  String snr;
+
+  if (!parseRcvFrame(line, senderAddress, messageData, rssi, snr)) {
+    return;
+  }
+
+  VLOG("Received message: " + line);
+  VLOG("From: " + senderAddress);
+  VLOG("Message: " + messageData);
+  VLOG("RSSI: " + rssi + " dBm");
+  VLOG("SNR: " + snr + " dB");
+
+  if (isDeployCommand(messageData)) {
+    sDeployCommandPending = true;
+    Serial.println("[RXCMD] Deploy airbrake command detected");
+  }
+}
+
+static void pumpIncoming(uint32_t budgetMs)
+{
+  uint32_t startMs = millis();
+
+  while (true) {
+    bool consumedAny = false;
+    while (loraSerial.available() > 0) {
+      consumedAny = true;
+      char c = static_cast<char>(loraSerial.read());
+
+      if (c == '\r') {
+        continue;
+      }
+
+      if (c == '\n') {
+        sRxLine.trim();
+        handleIncomingLine(sRxLine);
+        sRxLine = "";
+      } else {
+        sRxLine += c;
+      }
+    }
+
+    if (budgetMs == 0) {
+      break;
+    }
+
+    if (millis() - startMs >= budgetMs) {
+      break;
+    }
+
+    if (!consumedAny) {
+      delay(1);
+    }
+  }
+}
+
 bool transmitterInit() {
-  Serial.println("ESP32 WROVER-E LoRa Transmitter Starting...");
+  VLOG("ESP32 WROVER-E LoRa Transmitter Starting...");
 
   // Optional: Hardware reset of LoRa module
   #ifdef LORA_RST_PIN
@@ -44,43 +147,62 @@ bool transmitterInit() {
     loraSerial.read();
   }
 
-  // Test communication with LoRa module
-  Serial.println("Testing LoRa module communication...");
-  if (!sendATCommand("AT")) {
+  // Test communication with LoRa module — retry up to 5x, module can be slow to boot
+  VLOG("Testing LoRa module communication...");
+  bool atOk = false;
+  for (int attempt = 0; attempt < 5 && !atOk; attempt++) {
+    if (attempt > 0) {
+      Serial.printf("[LORA] AT retry %d/4...\n", attempt);
+      delay(1000);
+    }
+    atOk = sendATCommand("AT");
+  }
+  if (!atOk) {
+    Serial.println("[LORA] Module not responding — check wiring on GPIO21/22 and power");
     return false;
   }
 
   // Configure LoRa module
-  Serial.println("Configuring LoRa module...");
-  
-  // Set frequency band (915MHz for US, change to 868000000 for EU)
-  // Check your local regulations!
-  if (!sendATCommand("AT+BAND=" + String(LORA_BAND))) {
-    return false;
-  }
-  
-  // Set network ID (0-15) to avoid interference
-  if (!sendATCommand("AT+NETWORKID=" + String(NETWORK_ID))) {
-    return false;
-  }
-  
-  // Set this module's address
-  if (!sendATCommand("AT+ADDRESS=" + String(DEVICE_ADDRESS))) {
-    return false;
-  }
-  
-  // Optional: Set transmission power (5-22 dBm)
-  if (!sendATCommand("AT+PARAMETER=9,7,1,12")) {
+  VLOG("Configuring LoRa module...");
+
+    // Start from a known state before applying the requested profile.
+    // After reset, module emits +READY when it boots — flush it before next command.
+    sendATCommand("AT+RESET", 2000, false);
+    delay(2500);
+    while (loraSerial.available()) loraSerial.read();
+
+    if (!sendATCommand("AT+BAND=" + String(LORA_BAND))) {
+      return false;
+    }
+
+    if (!sendATCommand("AT+NETWORKID=" + String(NETWORK_ID))) {
+      return false;
+    }
+
+    if (!sendATCommand("AT+ADDRESS=" + String(DEVICE_ADDRESS))) {
+      return false;
+    }
+
+    if (!sendATCommand("AT+PARAMETER=7,8,1,12")) {
+      return false;
+    }
+
+    if (!sendATCommand("AT+CRFOP=" + String(LORA_CRFOP))) {
     return false;
   }
 
+    if (!sendATCommand("AT+MODE=0")) {
+      return false;
+    }
+
   // Print back key config so mismatches are obvious.
-  sendATCommand("AT+BAND?");
-  sendATCommand("AT+NETWORKID?");
-  sendATCommand("AT+ADDRESS?");
-  sendATCommand("AT+PARAMETER?");
+    sendATCommand("AT+PARAMETER?", 1000, false);
+    sendATCommand("AT+BAND?", 1000, false);
+    sendATCommand("AT+CRFOP?", 1000, false);
+    sendATCommand("AT+NETWORKID?", 1000, false);
+    sendATCommand("AT+ADDRESS?", 1000, false);
   
-  Serial.println("LoRa Module configured successfully!");
+  VLOG("LoRa Module configured successfully!");
   return true;
 }
 
@@ -89,7 +211,18 @@ bool transmitterSend(const String &payload) {
 }
 
 void transmitterPoll() {
-  checkForMessages();
+  pumpIncoming(0);
+}
+
+bool transmitterReceiveDeployCommandWindow(uint32_t windowMs) {
+  pumpIncoming(windowMs);
+
+  if (!sDeployCommandPending) {
+    return false;
+  }
+
+  sDeployCommandPending = false;
+  return true;
 }
 
 String readModuleResponse(uint32_t timeoutMs) {
@@ -113,25 +246,31 @@ String readModuleResponse(uint32_t timeoutMs) {
   return response;
 }
 
-bool sendATCommand(String command, uint32_t timeoutMs) {
-  Serial.println("Sending: " + command);
+bool sendATCommand(String command, uint32_t timeoutMs, bool expectOk) {
+  VLOG("Sending: " + command);
   loraSerial.println(command);
   String response = readModuleResponse(timeoutMs);
 
   if (response.length() == 0) {
-    Serial.println("Response: [no reply]");
+    if (expectOk) Serial.printf("[LORA] No reply to: %s\n", command.c_str());
     return false;
   }
 
-  Serial.println("Response: " + response);
-  return response.indexOf("+OK") >= 0 || response == "OK";
+  VLOG("Response: " + response);
+  if (!expectOk) {
+    return true;
+  }
+
+  bool ok = response.indexOf("+OK") >= 0 || response == "OK";
+  if (!ok) Serial.printf("[LORA] Unexpected reply to %s: %s\n", command.c_str(), response.c_str());
+  return ok;
 }
 
 bool sendMessage(int address, String message) {
   // AT command format: AT+SEND=[Address],[Payload Length],[Payload]
   String atCommand = "AT+SEND=" + String(address) + "," + String(message.length()) + "," + message;
   
-  Serial.println("Transmitting to address " + String(address) + ": " + message);
+  // Serial.println("Transmitting to address " + String(address) + ": " + message);
   loraSerial.println(atCommand);
   
   String response = readModuleResponse(1200);
@@ -141,7 +280,7 @@ bool sendMessage(int address, String message) {
   }
 
   if (response.indexOf("+OK") >= 0 || response == "OK") {
-    Serial.println("Message sent successfully!");
+    // Serial.println("Message sent successfully!");
     return true;
   } else {
     Serial.println("Transmission failed: " + response);
@@ -150,37 +289,7 @@ bool sendMessage(int address, String message) {
 }
 
 void checkForMessages() {
-  // Check if there are any incoming messages
-  if (loraSerial.available()) {
-    String incoming = loraSerial.readString();
-    incoming.trim();
-    
-    // Parse incoming message format: +RCV=[Address],[Length],[Data],[RSSI],[SNR]
-    if (incoming.startsWith("+RCV=")) {
-      Serial.println("Received message: " + incoming);
-      
-      // Extract message components
-      int firstComma = incoming.indexOf(',');
-      int secondComma = incoming.indexOf(',', firstComma + 1);
-      int thirdComma = incoming.indexOf(',', secondComma + 1);
-      int fourthComma = incoming.indexOf(',', thirdComma + 1);
-      
-      if (firstComma > 0 && secondComma > 0 && thirdComma > 0 && fourthComma > 0) {
-        String senderAddress = incoming.substring(5, firstComma);
-        String messageLength = incoming.substring(firstComma + 1, secondComma);
-        String messageData = incoming.substring(secondComma + 1, thirdComma);
-        String rssi = incoming.substring(thirdComma + 1, fourthComma);
-        String snr = incoming.substring(fourthComma + 1);
-        
-        Serial.println("From: " + senderAddress);
-        Serial.println("Message: " + messageData);
-        Serial.println("RSSI: " + rssi + " dBm");
-        Serial.println("SNR: " + snr + " dB");
-      } else {
-        Serial.println("Received unparseable message: " + incoming);
-      }
-    }
-  }
+  pumpIncoming(0);
 }
 
 // Optional: Function to put ESP32 into deep sleep to save power

@@ -12,21 +12,37 @@
 // GPIO 21/22 are reserved for LoRa UART; GPIO 25/26 are reserved for IMU I2C
 #define BMP280_SDA_PIN    18
 #define BMP280_SCL_PIN    19
-//APP for hpa -- PhyPhox
-//https://engineering.icalculator.com/sea-level-pressure-calculator.html
-#define SEA_LEVEL_HPA 1019.022f  // Standard sea level pressure in hPa (ISA)
-// #define BMP280_CHIP_ID  0x58
+
+// SEA_LEVEL_HPA is kept for reference / manual overrides but is no longer
+// used as the default — bar_calibrate() derives ground pressure at boot.
+#define SEA_LEVEL_HPA 1019.022f
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
  * @brief  Initialise the BMP280 over I2C1 (Wire1).
- *         Call once from setup(). Initializes Wire1 on GPIO 21/22 (separate
+ *         Call once from setup(). Initializes Wire1 on GPIO 18/19 (separate
  *         from the IMU's I2C0 on GPIO 25/26). Safe to call after imuInit().
  * @return true  on success
  *         false if the sensor is not detected or chip-ID check fails
  */
 bool bar_init(void);
+
+/**
+ * @brief  Sample ground pressure over a set window and store it as the AGL
+ *         reference. Call once from setup() after bar_init().
+ *         Prints progress and the final calibrated value to Serial.
+ * @param  samples     Number of pressure readings to average (default 100)
+ * @param  duration_ms Total sampling window in ms (default 10 000)
+ * @return Calibrated ground pressure in hPa, or -999.0f on failure.
+ */
+float bar_calibrate(uint16_t samples = 100, uint32_t duration_ms = 10000);
+
+/**
+ * @brief  Return the ground pressure established by bar_calibrate().
+ * @return Ground pressure in hPa, or 0.0f if not yet calibrated.
+ */
+float bar_get_ground_pressure(void);
 
 /**
  * @brief  Read compensated temperature from the BMP280.
@@ -48,14 +64,29 @@ float bar_get_pressure(void);
 float bar_get_altitude(float sea_level_hpa = 1013.25f);
 
 /**
+ * @brief  Altitude above ground level using the calibrated ground pressure.
+ *         Returns -999.0f if bar_calibrate() has not been called yet.
+ * @return Altitude AGL in metres.
+ */
+float bar_get_altitude_agl(void);
+
+/**
  * @brief  Convenience: fill all three values in one I2C transaction burst.
  * @param[out] temp_c        Temperature in °C
  * @param[out] pressure_hpa  Pressure in hPa
- * @param[out] altitude_m    Altitude in metres (uses sea_level_hpa)
- * @param[in]  sea_level_hpa Reference pressure (default ISA)
+ * @param[out] altitude_m    Altitude AGL in metres (uses calibrated ground pressure)
  * @return true on success
  */
 bool bar_read_all(float &temp_c,
                   float &pressure_hpa,
-                  float &altitude_m,
-                  float  sea_level_hpa = 1013.25f);
+                  float &altitude_m);
+
+// Barometer sampling profiles — choose a profile depending on whether an
+// IMU is present and whether you need maximum smoothing (baro-only).
+typedef enum {
+    BARO_PROFILE_IMU_KALMAN = 0, // faster updates, moderate filter
+    BARO_PROFILE_BARO_ONLY       // maximum oversampling + filtering
+} BaroProfile;
+
+/** Set the BMP280 sampling profile. Safe to call at runtime; applies new sampling. */
+void bar_set_profile(BaroProfile profile);
